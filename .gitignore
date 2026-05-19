@@ -1,0 +1,48 @@
+# macOS
+.DS_Store
+*.swp
+
+# Swift / SPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Signing material — never commit local developer identities or profiles
+*.p12
+*.pem
+*.key
+*.cer
+*.crt
+*.der
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
+
+# Build outputs
+build/
+dist/
+*.app/
+*.dSYM/
+
+# Large local model weights — never commit
+**/Models/*.gguf
+**/Models/*.bin
+**/Models/*.safetensors
+
+# Bundled helper binaries — not source, dropped in by scripts/build-app.sh
+vendor/
+Resources/llama/llama-server-arm64
+
+# Local config
+.env
+*.local
+.cloudflared/
