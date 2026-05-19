@@ -136,9 +136,7 @@ final class AppState: ObservableObject {
     private let networkPathQueue = DispatchQueue(label: "com.typeforme.ios.network-path")
     private static let inputModeKey = "keyboard.inputMode"
     private static let hostAudioSessionLengthKey = "keyboard.hostAudioSessionLength"
-    private static let keyboardWakePasteboardName = UIPasteboard.Name("com.typeforme.keyboard.wake")
     private static let keyboardDefaultsPasteboardName = UIPasteboard.Name("com.typeforme.keyboard.defaults")
-    private static let keyboardWakeMaxAge: TimeInterval = 12
     private static let returnTraceLogName = "typeforme-return-trace.log"
     /// Keeps an input audio session alive while keyboard standby is on. iOS
     /// keyboard extensions cannot open the microphone, so the host app owns a
@@ -260,7 +258,6 @@ final class AppState: ObservableObject {
     func bootstrap() async {
         await waitForInitialRenderOpportunity()
         await setKeyboardStandby(true)
-        await handlePendingKeyboardWakeRequest(reason: "bootstrap")
         await refreshRoute(force: true)
         _ = try? await refreshMacSettings()
     }
@@ -275,7 +272,6 @@ final class AppState: ObservableObject {
         publishKeyboardDefaults()
         routeFetchedAt = nil
         Task {
-            await handlePendingKeyboardWakeRequest(reason: "foreground")
             await refreshRoute(force: true)
             _ = try? await refreshMacSettings()
         }
@@ -453,6 +449,7 @@ final class AppState: ObservableObject {
         }
         guard phase.allowsRecordingStart else { return }
 
+        resetCorrectionModeToDefault()
         hostHoldReleasePending = false
         isHostRecordStarting = true
         setPhase(.preparing)
@@ -495,7 +492,6 @@ final class AppState: ObservableObject {
 
     func startRecording() async {
         errorMessage = nil
-        setPhase(.preparing)
         guard isConfigured else {
             setFailure("Pair the Mac Bridge first.")
             return
@@ -505,6 +501,8 @@ final class AppState: ObservableObject {
             return
         }
 
+        resetCorrectionModeToDefault()
+        setPhase(.preparing)
         do {
             try await startHostRecordingCapture()
             acquireIdleTimer()
@@ -530,7 +528,6 @@ final class AppState: ObservableObject {
 
     func stopAndSend(keyboardCommandID: String? = nil) async {
         let requestedCorrectionMode = correctionMode
-        defer { resetCorrectionModeToDefault() }
         let keyboardCaptureWasStartedFromKeyboard = keyboardCaptureStartedFromKeyboard
         keyboardCaptureStartedFromKeyboard = false
         let isHostStandbyCapture = keyboardCommandID == nil
@@ -751,7 +748,6 @@ final class AppState: ObservableObject {
             lastGeneratedResultText = nil
             return
         }
-        defer { resetCorrectionModeToDefault() }
         await refreshRoute(force: true, probeAllEndpoints: false)
         guard let baseURL = routeStatus.activeURL else {
             setFailure("Bridge unavailable. Check pairing, Local URL, or Cloud URL.")
@@ -842,18 +838,19 @@ final class AppState: ObservableObject {
             return
         }
         lastHandledOpenURL = (url.absoluteString, now)
-        resetReturnTrace("openURL url=\(url.absoluteString) sourceApplication=\(sourceApplication ?? "nil")")
-        appLog.notice("handleOpenURL: received \(url.absoluteString, privacy: .public), sourceApplication=\(sourceApplication ?? "nil", privacy: .public)")
+        appLog.notice("handleOpenURL: received \(url.absoluteString, privacy: .public)")
         await waitForInitialRenderOpportunity()
         let action = url.host ?? url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var source: String?
         var shouldReturnToKeyboard = false
         var returnBundleID: String?
         var returnProcessID: Int32?
-        var source: String?
-        var urlDebugLines: [String] = []
         if let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
             let items = components.queryItems ?? []
             applyKeyboardParameters(items, allowCorrectionMode: action == "record")
+            source = items.first { $0.name == "source" }?
+                .value?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             shouldReturnToKeyboard = items.contains { item in
                 item.name == "return" && item.value == "1"
             }
@@ -863,28 +860,8 @@ final class AppState: ObservableObject {
             returnProcessID = items.first { $0.name == "return_pid" }?
                 .value
                 .flatMap(Int32.init)
-            source = items.first { $0.name == "source" }?
-                .value?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            urlDebugLines = items
-                .filter { $0.name == "debug" }
-                .compactMap { $0.value }
         }
-        let explicitReturnBundleID = returnBundleID
-        returnBundleID = resolvedReturnBundleID(
-            explicitBundleID: returnBundleID,
-            sourceApplication: sourceApplication,
-            processID: returnProcessID
-        )
-        appendReturnTrace("openURL parsed action=\(action) source=\(source ?? "nil") return=\(shouldReturnToKeyboard) explicitBundle=\(explicitReturnBundleID ?? "nil") resolvedBundle=\(returnBundleID ?? "nil") pid=\(returnProcessID.map(String.init) ?? "nil")")
-        for line in urlDebugLines.prefix(80) {
-            appendReturnTrace("keyboardURLDebug \(line)")
-        }
-        appLog.notice("handleOpenURL: action=\(action, privacy: .public), source=\(source ?? "nil", privacy: .public), return=\(shouldReturnToKeyboard, privacy: .public), bundle=\(returnBundleID ?? "nil", privacy: .public), pid=\(returnProcessID.map(String.init) ?? "nil", privacy: .public)")
-        if source == "keyboard" {
-            appendKeyboardWakePasteboardTrace(reason: "openURL")
-            clearKeyboardWakeRequest()
-        }
+        appLog.notice("handleOpenURL: action=\(action, privacy: .public), source=\(source ?? "nil", privacy: .public)")
         if action == "record" {
             if source == "keyboard" {
                 await setKeyboardStandby(true)
@@ -892,15 +869,15 @@ final class AppState: ObservableObject {
             } else {
                 await toggleRecording()
             }
-            if shouldReturnToKeyboard {
-                await returnToPreviousAppSoon(bundleID: returnBundleID)
-            }
         } else if action == "standby" {
-            if shouldReturnToKeyboard {
-                await prepareKeyboardAndReturnToPreviousApp(bundleID: returnBundleID)
-            } else {
-                await setKeyboardStandby(true)
-            }
+            await setKeyboardStandby(true)
+        }
+        if shouldReturnToKeyboard {
+            await returnToPreviousAppSoon(bundleID: resolvedReturnBundleID(
+                explicitBundleID: returnBundleID,
+                sourceApplication: sourceApplication,
+                processID: returnProcessID
+            ))
         }
     }
 
@@ -997,105 +974,12 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func handlePendingKeyboardWakeRequest(reason: String) async {
-        guard let pasteboard = UIPasteboard(name: Self.keyboardWakePasteboardName, create: false),
-              let text = pasteboard.string,
-              let data = text.data(using: .utf8),
-              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            appLog.notice("keyboardWakeRequest: none for \(reason, privacy: .public)")
-            return
-        }
-
-        let id = payload["id"] as? String ?? "unknown"
-        let source = payload["source"] as? String
-        let action = payload["action"] as? String ?? "standby"
-        let shouldReturn = payload["return"] as? Bool ?? false
-        let createdAt = payload["created_at"] as? TimeInterval ?? 0
-        let age = Date().timeIntervalSince1970 - createdAt
-        let explicitReturnBundleID = (payload["return_bundle"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let returnProcessID = returnProcessID(from: payload["return_pid"])
-        let returnBundleID = resolvedReturnBundleID(
-            explicitBundleID: explicitReturnBundleID,
-            sourceApplication: nil,
-            processID: returnProcessID
-        )
-        let correctionModeValue = payload["correction_mode"] as? String
-        resetReturnTrace("wakeRequest id=\(id) reason=\(reason) source=\(source ?? "nil") action=\(action) return=\(shouldReturn) explicitBundle=\(explicitReturnBundleID ?? "nil") resolvedBundle=\(returnBundleID ?? "nil") pid=\(returnProcessID.map(String.init) ?? "nil") age=\(String(format: "%.3f", age))")
-        appendKeyboardWakePayloadTrace(payload, reason: reason)
-
-        if source != "keyboard" || createdAt <= 0 || age > Self.keyboardWakeMaxAge {
-            appLog.notice("keyboardWakeRequest: clearing stale/invalid id=\(id, privacy: .public), source=\(source ?? "nil", privacy: .public), age=\(age, privacy: .public)")
-            appendReturnTrace("wakeRequest staleOrInvalid source=\(source ?? "nil") age=\(String(format: "%.3f", age))")
-            clearKeyboardWakeRequest()
-            return
-        }
-
-        appLog.notice("keyboardWakeRequest: handling id=\(id, privacy: .public), reason=\(reason, privacy: .public), action=\(action, privacy: .public), return=\(shouldReturn, privacy: .public), bundle=\(returnBundleID ?? "nil", privacy: .public), pid=\(returnProcessID.map(String.init) ?? "nil", privacy: .public), age=\(age, privacy: .public)")
-        clearKeyboardWakeRequest()
-
-        if action == "record",
-           let correctionModeValue,
-           let nextMode = CorrectionModeID(rawValue: correctionModeValue) {
-            correctionMode = nextMode
-        }
-
-        switch action {
-        case "record":
-            await setKeyboardStandby(true)
-            await startKeyboardRecording(commandID: nil, allowSessionStart: true)
-            if shouldReturn {
-                await returnToPreviousAppSoon(bundleID: returnBundleID)
+    private func requestMicrophonePermission() async -> Bool {
+        await withCheckedContinuation { continuation in
+            AVAudioApplication.requestRecordPermission { granted in
+                continuation.resume(returning: granted)
             }
-        case "standby":
-            if shouldReturn {
-                await prepareKeyboardAndReturnToPreviousApp(bundleID: returnBundleID)
-            } else {
-                await setKeyboardStandby(true)
-            }
-        default:
-            appLog.notice("keyboardWakeRequest: unsupported action \(action, privacy: .public)")
         }
-    }
-
-    private func clearKeyboardWakeRequest() {
-        UIPasteboard(name: Self.keyboardWakePasteboardName, create: false)?.string = nil
-    }
-
-    private func appendKeyboardWakePasteboardTrace(reason: String) {
-        guard let pasteboard = UIPasteboard(name: Self.keyboardWakePasteboardName, create: false),
-              let text = pasteboard.string,
-              let data = text.data(using: .utf8),
-              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            appendReturnTrace("keyboardWakePayload unavailable reason=\(reason)")
-            return
-        }
-        appendKeyboardWakePayloadTrace(payload, reason: reason)
-    }
-
-    private func appendKeyboardWakePayloadTrace(_ payload: [String: Any], reason: String) {
-        let explicitBundle = (payload["return_bundle"] as? String) ?? "nil"
-        let pid = returnProcessID(from: payload["return_pid"]).map(String.init) ?? "nil"
-        appendReturnTrace("keyboardWakePayload reason=\(reason) explicitBundle=\(explicitBundle) pid=\(pid)")
-    }
-
-    private func returnProcessID(from value: Any?) -> Int32? {
-        if let number = value as? NSNumber {
-            let pid = number.int32Value
-            return pid > 0 ? pid : nil
-        }
-        if let int = value as? Int {
-            let pid = Int32(int)
-            return pid > 0 ? pid : nil
-        }
-        if let string = value as? String,
-           let pid = Int32(string.trimmingCharacters(in: .whitespacesAndNewlines)),
-           pid > 0 {
-            return pid
-        }
-        return nil
     }
 
     private func resolvedReturnBundleID(
@@ -1108,34 +992,15 @@ final class AppState: ObservableObject {
             appendReturnTrace("resolvedReturnBundleID explicit=\(explicitBundleID)")
             return explicitBundleID
         }
-
         if let sourceApplication = sourceApplication?.trimmingCharacters(in: .whitespacesAndNewlines),
            isUsableReturnBundleID(sourceApplication) {
-            appLog.notice("resolvedReturnBundleID: using sourceApplication \(sourceApplication, privacy: .public)")
             appendReturnTrace("resolvedReturnBundleID sourceApplication=\(sourceApplication)")
             return sourceApplication
         }
-
         if let processID {
             appendReturnTrace("resolvedReturnBundleID pidLookupSkipped pid=\(processID)")
         }
-
-        appendReturnTrace("resolvedReturnBundleID unresolved explicit=\(explicitBundleID ?? "nil") sourceApplication=\(sourceApplication ?? "nil") pid=\(processID.map(String.init) ?? "nil")")
         return nil
-    }
-
-    private func prepareKeyboardAndReturnToPreviousApp(bundleID: String?) async {
-        appLog.notice("prepareKeyboardAndReturnToPreviousApp: bundle=\(bundleID ?? "nil", privacy: .public)")
-        await setKeyboardStandby(true)
-        await returnToPreviousAppSoon(bundleID: bundleID)
-    }
-
-    private func requestMicrophonePermission() async -> Bool {
-        await withCheckedContinuation { continuation in
-            AVAudioApplication.requestRecordPermission { granted in
-                continuation.resume(returning: granted)
-            }
-        }
     }
 
     private func returnToPreviousAppSoon(bundleID: String?) async {
@@ -1361,7 +1226,6 @@ final class AppState: ObservableObject {
             return
         }
         correctionMode = requestedCorrectionMode
-        defer { resetCorrectionModeToDefault() }
 
         publishKeyboardStatus(.sending, commandID: command.id, message: "Rewriting text")
         await refreshRoute(force: true, probeAllEndpoints: false)

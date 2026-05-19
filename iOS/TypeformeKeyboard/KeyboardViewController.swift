@@ -51,11 +51,9 @@ final class KeyboardViewController: UIInputViewController {
     private let inputModeKey = "keyboard.inputMode"
     private let lastInsertedTextKey = "keyboard.lastInsertedText"
     private let lastInsertedCommandIDKey = "keyboard.lastInsertedCommandID"
-    private let hostWakePasteboardName = UIPasteboard.Name("com.typeforme.keyboard.wake")
     private let keyboardDefaultsPasteboardName = UIPasteboard.Name("com.typeforme.keyboard.defaults")
 
     private var correctionMode: CorrectionModePreset = .polish
-    private var hasUserSelectedCorrectionMode = false
     private var inputMode: VoiceInputMode = .hold
     private var heightConstraint: NSLayoutConstraint?
     private var statusTimer: Timer?
@@ -239,7 +237,6 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func resetCorrectionModeToDefault() {
-        hasUserSelectedCorrectionMode = false
         correctionMode = defaultCorrectionModeFromHost() ?? .polish
         lastCorrectionModeButtonSignature = ""
     }
@@ -401,7 +398,7 @@ final class KeyboardViewController: UIInputViewController {
                     guard let self else { return }
                     let wasStarting = self.isStartRequestInFlight
                     self.finishStoppedNotification()
-                    if wasStarting, !self.isOpeningHostApp {
+                    if wasStarting {
                         self.openHostForDictation()
                         return
                     }
@@ -1165,7 +1162,7 @@ final class KeyboardViewController: UIInputViewController {
         textEditContext: KeyboardTextEditContext?,
         target: TextRewriteTarget?
     ) {
-        kbLog.notice("probeBridgeThenBeginDictation: checking local keyboard server before opening host")
+        kbLog.notice("probeBridgeThenBeginDictation: checking local keyboard server")
         isStartRequestInFlight = true
         shouldStopWhenStartCompletes = false
         shouldCancelWhenStartCompletes = false
@@ -1241,7 +1238,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func openHostForDictation() {
-        kbLog.notice("openHostForDictation: bridge unavailable — waking host app")
+        kbLog.notice("openHostForDictation: bridge unavailable; opening host app")
         isStartRequestInFlight = false
         shouldStopWhenStartCompletes = false
         shouldCancelWhenStartCompletes = false
@@ -1251,11 +1248,277 @@ final class KeyboardViewController: UIInputViewController {
         isVoicePressActive = false
         isCommandPressActive = false
         activeRecordingTextTarget = nil
+        cancelScheduledHostOpen()
         openHostAppForKeyboardAction(
             "standby",
             returnToKeyboard: true,
             openingMessage: "Opening Typeforme to prepare dictation."
         )
+    }
+
+    private func openStandbyInHostApp(returnToKeyboard: Bool = true) {
+        openHostAppForKeyboardAction(
+            "standby",
+            returnToKeyboard: returnToKeyboard,
+            openingMessage: "Opening Typeforme to prepare dictation."
+        )
+    }
+
+    private func openHostAppForKeyboardAction(
+        _ action: String,
+        returnToKeyboard: Bool,
+        openingMessage: String
+    ) {
+        var components = URLComponents()
+        components.scheme = "typeforme"
+        components.host = action
+        var queryItems = [
+            URLQueryItem(name: "source", value: "keyboard"),
+            URLQueryItem(name: "return", value: returnToKeyboard ? "1" : "0"),
+            URLQueryItem(name: "correction_mode", value: correctionMode.rawValue),
+        ]
+        if returnToKeyboard, let returnBundleID = currentHostBundleID {
+            queryItems.append(URLQueryItem(name: "return_bundle", value: returnBundleID))
+        }
+        if returnToKeyboard, let returnProcessID = currentHostProcessID {
+            queryItems.append(URLQueryItem(name: "return_pid", value: String(returnProcessID)))
+        }
+        components.queryItems = queryItems
+        guard let url = components.url else { return }
+        openingHostUntil = Date().timeIntervalSince1970 + 8
+        bridgeStatus = KeyboardBridgeStatus(state: .standby, message: openingMessage)
+        lastBridgeContactAt = Date().timeIntervalSince1970
+        updateUI()
+        openHostApp(url) { [weak self] success in
+            kbLog.notice("openHostAppForKeyboardAction: open success=\(success, privacy: .public)")
+            guard let self, !success else { return }
+            self.openingHostUntil = 0
+            self.tapRecordingActive = false
+            self.bridgeStatus = KeyboardBridgeStatus(state: .error, message: "Open Typeforme to prepare dictation.")
+            self.lastBridgeContactAt = Date().timeIntervalSince1970
+            self.updateUI()
+        }
+    }
+
+    private func openHostApp(_ url: URL, completion: @escaping (Bool) -> Void) {
+        kbLog.notice("openHostApp: opening via LSApplicationWorkspace")
+        completion(openHostAppViaApplicationWorkspace(url))
+    }
+
+    private func openHostAppViaApplicationWorkspace(_ url: URL) -> Bool {
+        guard let workspaceClass = objc_getClass("LSApplicationWorkspace") as? AnyObject else {
+            kbLog.notice("openHostAppViaApplicationWorkspace: LSApplicationWorkspace unavailable")
+            return false
+        }
+        let defaultSelector = NSSelectorFromString("defaultWorkspace")
+        guard let workspace = workspaceClass.perform(defaultSelector)?.takeUnretainedValue() as? NSObject else {
+            kbLog.notice("openHostAppViaApplicationWorkspace: defaultWorkspace unavailable")
+            return false
+        }
+
+        let openSensitiveSelector = NSSelectorFromString("openSensitiveURL:withOptions:")
+        guard workspace.responds(to: openSensitiveSelector),
+              let imp = workspace.method(for: openSensitiveSelector)
+        else {
+            kbLog.notice("openHostAppViaApplicationWorkspace: openSensitiveURL unavailable")
+            return false
+        }
+
+        kbLog.notice("openHostAppViaApplicationWorkspace: opening URL via openSensitiveURL")
+        typealias OpenSensitiveURL = @convention(c) (AnyObject, Selector, NSURL, NSDictionary) -> Void
+        let openSensitiveURL = unsafeBitCast(imp, to: OpenSensitiveURL.self)
+        openSensitiveURL(workspace, openSensitiveSelector, url as NSURL, NSDictionary())
+        return true
+    }
+
+    private var currentHostBundleID: String? {
+        if let id = privateStringValue(named: "_hostApplicationBundleIdentifier", from: self),
+           isUsableReturnBundleID(id) {
+            return id
+        }
+        if let id = privateStringValue(named: "_hostBundleID", from: parent),
+           isUsableReturnBundleID(id) {
+            return id
+        }
+        guard let pid = currentHostProcessID else { return nil }
+        let hostPID: AnyObject = NSNumber(value: pid)
+        return currentHostBundleIDFromXPC(hostPID: hostPID).flatMap {
+            isUsableReturnBundleID($0) ? $0 : nil
+        }
+    }
+
+    private var currentHostProcessID: Int32? {
+        if let number = privateIntMethodValue(named: "_hostProcessIdentifier", from: self),
+           number.int32Value > 0 {
+            return number.int32Value
+        }
+        guard let hostPID = privateObjectValue(named: "_hostPID", from: parent),
+              let pid = intValue(from: hostPID),
+              pid > 0
+        else { return nil }
+        return pid
+    }
+
+    private func currentHostBundleIDFromXPC(hostPID: AnyObject) -> String? {
+        guard let serviceClass = NSClassFromString("PKService") else { return nil }
+        let serviceObject = serviceClass as AnyObject
+        let defaultServiceSelector = NSSelectorFromString("defaultService")
+        guard serviceObject.responds(to: defaultServiceSelector),
+              let service = serviceObject.perform(defaultServiceSelector)?.takeUnretainedValue() as? NSObject
+        else { return nil }
+
+        let personalitiesSelector = NSSelectorFromString("personalities")
+        guard service.responds(to: personalitiesSelector),
+              let personalities = service.perform(personalitiesSelector)?.takeUnretainedValue() as? NSDictionary
+        else { return nil }
+
+        let extensionBundleIDs = [
+            Bundle.main.bundleIdentifier,
+            Bundle(for: type(of: self)).bundleIdentifier,
+        ].compactMap { $0 }
+
+        for extensionBundleID in extensionBundleIDs {
+            guard let infos = personalities.object(forKey: extensionBundleID) as? NSDictionary,
+                  let info = infos.object(forKey: hostPID) as? NSObject,
+                  let connection = privateObjectValue(named: "connection", from: info),
+                  let xpcConnection = privateObjectValue(named: "_xpcConnection", from: connection),
+                  let bundleID = copyBundleID(fromXPCConnection: xpcConnection)
+            else { continue }
+            return bundleID
+        }
+        return nil
+    }
+
+    private func copyBundleID(fromXPCConnection connection: AnyObject) -> String? {
+        guard let handle = dlopen(nil, RTLD_NOW),
+              let symbol = dlsym(handle, "xpc_connection_copy_bundle_id")
+        else { return nil }
+        typealias CopyBundleID = @convention(c) (AnyObject) -> UnsafePointer<CChar>?
+        let copyBundleID = unsafeBitCast(symbol, to: CopyBundleID.self)
+        guard let cString = copyBundleID(connection) else { return nil }
+        return String(cString: cString)
+    }
+
+    private func intValue(from object: AnyObject) -> Int32? {
+        if let number = object as? NSNumber {
+            return number.int32Value
+        }
+        return Int32(String(describing: object).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func isUsableReturnBundleID(_ id: String) -> Bool {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "<null>" else { return false }
+        guard isBundleIdentifierShape(trimmed) else { return false }
+        guard trimmed != Bundle.main.bundleIdentifier else { return false }
+        guard !trimmed.hasPrefix("com.typeforme.") else { return false }
+        guard !trimmed.hasPrefix("com.btcdtc.typeforme") else { return false }
+        return true
+    }
+
+    private func isBundleIdentifierShape(_ value: String) -> Bool {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return false }
+        return parts.allSatisfy { part in
+            !part.isEmpty && part.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+        }
+    }
+
+    private func privateStringValue(named name: String, from object: AnyObject?) -> String? {
+        guard let value = privateObjectValue(named: name, from: object) else { return nil }
+        if let string = value as? String { return string }
+        if let number = value as? NSNumber { return number.stringValue }
+        let text = String(describing: value)
+        return text == "<null>" ? nil : text
+    }
+
+    private func privateObjectValue(named name: String, from object: AnyObject?) -> AnyObject? {
+        guard let object else { return nil }
+        let selector = NSSelectorFromString(name)
+        if object.responds(to: selector) {
+            if let returnTypeText = methodReturnType(named: selector, from: object) {
+                if returnTypeText.hasPrefix("@") || returnTypeText == "#" {
+                    return object.perform(selector)?.takeUnretainedValue()
+                }
+                return privateIntMethodValue(named: name, from: object)
+            }
+            return object.perform(selector)?.takeUnretainedValue()
+        }
+
+        var nextClass: AnyClass? = object_getClass(object)
+        while let currentClass = nextClass {
+            if let ivar = class_getInstanceVariable(currentClass, name) {
+                return privateIvarValue(ivar, from: object)
+            }
+            nextClass = class_getSuperclass(currentClass)
+        }
+        return nil
+    }
+
+    private func privateIntMethodValue(named name: String, from object: AnyObject?) -> NSNumber? {
+        guard let object else { return nil }
+        let selector = NSSelectorFromString(name)
+        guard object.responds(to: selector),
+              let returnTypeText = methodReturnType(named: selector, from: object),
+              let imp = object.method(for: selector)
+        else { return nil }
+
+        switch returnTypeText {
+        case "i":
+            typealias Getter = @convention(c) (AnyObject, Selector) -> Int32
+            return NSNumber(value: unsafeBitCast(imp, to: Getter.self)(object, selector))
+        case "I":
+            typealias Getter = @convention(c) (AnyObject, Selector) -> UInt32
+            return NSNumber(value: unsafeBitCast(imp, to: Getter.self)(object, selector))
+        case "q":
+            typealias Getter = @convention(c) (AnyObject, Selector) -> Int64
+            return NSNumber(value: unsafeBitCast(imp, to: Getter.self)(object, selector))
+        case "Q":
+            typealias Getter = @convention(c) (AnyObject, Selector) -> UInt64
+            return NSNumber(value: unsafeBitCast(imp, to: Getter.self)(object, selector))
+        case "s":
+            typealias Getter = @convention(c) (AnyObject, Selector) -> Int16
+            return NSNumber(value: unsafeBitCast(imp, to: Getter.self)(object, selector))
+        case "S":
+            typealias Getter = @convention(c) (AnyObject, Selector) -> UInt16
+            return NSNumber(value: unsafeBitCast(imp, to: Getter.self)(object, selector))
+        case "c", "B":
+            typealias Getter = @convention(c) (AnyObject, Selector) -> Bool
+            return NSNumber(value: unsafeBitCast(imp, to: Getter.self)(object, selector))
+        default:
+            return nil
+        }
+    }
+
+    private func methodReturnType(named selector: Selector, from object: AnyObject) -> String? {
+        guard let method = class_getInstanceMethod(type(of: object), selector),
+              method_getNumberOfArguments(method) == 2
+        else { return nil }
+        let returnType = method_copyReturnType(method)
+        let returnTypeText = String(cString: returnType)
+        free(returnType)
+        return returnTypeText
+    }
+
+    private func privateIvarValue(_ ivar: Ivar, from object: AnyObject) -> AnyObject? {
+        guard let typeEncoding = ivar_getTypeEncoding(ivar) else { return nil }
+        let type = String(cString: typeEncoding)
+        if type.hasPrefix("@") {
+            return object_getIvar(object, ivar) as AnyObject?
+        }
+
+        let offset = ivar_getOffset(ivar)
+        let rawPointer = Unmanaged.passUnretained(object).toOpaque().advanced(by: offset)
+        switch type {
+        case "i": return NSNumber(value: rawPointer.load(as: Int32.self))
+        case "I": return NSNumber(value: rawPointer.load(as: UInt32.self))
+        case "q": return NSNumber(value: rawPointer.load(as: Int64.self))
+        case "Q": return NSNumber(value: rawPointer.load(as: UInt64.self))
+        case "s": return NSNumber(value: rawPointer.load(as: Int16.self))
+        case "S": return NSNumber(value: rawPointer.load(as: UInt16.self))
+        case "c", "B": return NSNumber(value: rawPointer.load(as: Bool.self))
+        default: return nil
+        }
     }
 
     private func startDictationCommand(
@@ -1341,410 +1604,6 @@ final class KeyboardViewController: UIInputViewController {
         shouldCancelWhenStartCompletes = false
     }
 
-    private func openStandbyInHostApp(returnToKeyboard: Bool = true) {
-        openHostAppForKeyboardAction(
-            "standby",
-            returnToKeyboard: returnToKeyboard,
-            openingMessage: "Opening Typeforme to prepare dictation."
-        )
-    }
-
-    private func openHostAppForKeyboardAction(
-        _ action: String,
-        returnToKeyboard: Bool,
-        openingMessage: String
-    ) {
-        var components = URLComponents()
-        components.scheme = "typeforme"
-        components.host = action
-        var queryItems = [
-            URLQueryItem(name: "source", value: "keyboard"),
-            URLQueryItem(name: "return", value: returnToKeyboard ? "1" : "0"),
-            URLQueryItem(name: "correction_mode", value: correctionMode.rawValue),
-        ]
-        let returnBundleID = currentHostBundleID
-        let returnProcessID = currentHostProcessID
-        writeHostWakeRequest(
-            action: action,
-            returnToKeyboard: returnToKeyboard,
-            returnBundleID: returnBundleID,
-            returnProcessID: returnProcessID
-        )
-        if let returnBundleID {
-            kbLog.notice("openHostAppForKeyboardAction: captured return bundle \(returnBundleID, privacy: .public)")
-            queryItems.append(URLQueryItem(name: "return_bundle", value: returnBundleID))
-        } else {
-            kbLog.notice("openHostAppForKeyboardAction: no return bundle available")
-        }
-        if let returnProcessID {
-            kbLog.notice("openHostAppForKeyboardAction: captured return pid \(returnProcessID, privacy: .public)")
-            queryItems.append(URLQueryItem(name: "return_pid", value: String(returnProcessID)))
-        }
-        components.queryItems = queryItems
-        guard let url = components.url else { return }
-        kbLog.notice("openHostAppForKeyboardAction: attempting to open \(url.absoluteString, privacy: .public); extensionContext=\(self.extensionContext != nil, privacy: .public)")
-        openingHostUntil = Date().timeIntervalSince1970 + 8
-        bridgeStatus = KeyboardBridgeStatus(state: .standby, message: openingMessage)
-        lastBridgeContactAt = Date().timeIntervalSince1970
-        updateUI()
-        openHostApp(url) { [weak self] success in
-            kbLog.notice("openHostAppForKeyboardAction: open completion success=\(success, privacy: .public)")
-            guard let self, !success else { return }
-            self.openingHostUntil = 0
-            self.tapRecordingActive = false
-            self.bridgeStatus = KeyboardBridgeStatus(state: .error, message: "Open Typeforme once to prepare dictation.")
-            self.lastBridgeContactAt = 0
-            self.updateUI()
-        }
-    }
-
-    private func openHostApp(_ url: URL, completion: @escaping (Bool) -> Void) {
-        if let extensionContext {
-            kbLog.notice("openHostApp: opening via extensionContext.open")
-            extensionContext.open(url) { [weak self] success in
-                kbLog.notice("openHostApp: extensionContext.open completion success=\(success, privacy: .public)")
-                if success {
-                    completion(true)
-                    return
-                }
-                completion(self?.openHostAppViaApplicationWorkspace(url) ?? false)
-            }
-            return
-        }
-        kbLog.notice("openHostApp: extensionContext unavailable; using LSApplicationWorkspace")
-        completion(openHostAppViaApplicationWorkspace(url))
-    }
-
-    private func openHostAppViaApplicationWorkspace(_ url: URL) -> Bool {
-        guard let workspaceClass = objc_getClass("LSApplicationWorkspace") as? AnyObject else {
-            kbLog.notice("openHostAppViaApplicationWorkspace: LSApplicationWorkspace unavailable")
-            return false
-        }
-        let defaultSelector = NSSelectorFromString("defaultWorkspace")
-        guard let workspace = workspaceClass.perform(defaultSelector)?.takeUnretainedValue() as? NSObject else {
-            kbLog.notice("openHostAppViaApplicationWorkspace: defaultWorkspace unavailable")
-            return false
-        }
-
-        let openSensitiveSelector = NSSelectorFromString("openSensitiveURL:withOptions:")
-        if workspace.responds(to: openSensitiveSelector) {
-            kbLog.notice("openHostAppViaApplicationWorkspace: opening standby URL via openSensitiveURL")
-            _ = workspace.perform(openSensitiveSelector, with: url as NSURL, with: NSDictionary())
-            return true
-        }
-
-        let openURLSelector = NSSelectorFromString("openURL:")
-        if workspace.responds(to: openURLSelector) {
-            kbLog.notice("openHostAppViaApplicationWorkspace: opening standby URL via openURL")
-            _ = workspace.perform(openURLSelector, with: url as NSURL)
-            return true
-        }
-
-        let openBundleSelector = NSSelectorFromString("openApplicationWithBundleID:")
-        if workspace.responds(to: openBundleSelector) {
-            kbLog.notice("openHostAppViaApplicationWorkspace: opening host bundle without URL")
-            _ = workspace.perform(openBundleSelector, with: "com.btcdtc.typeforme")
-            return true
-        }
-
-        kbLog.notice("openHostAppViaApplicationWorkspace: no usable open selector")
-        return false
-    }
-
-    private var currentHostBundleID: String? {
-        if let id = privateStringValue(named: "_hostApplicationBundleIdentifier", from: self),
-           isUsableReturnBundleID(id) {
-            kbLog.notice("currentHostBundleID: resolved via _hostApplicationBundleIdentifier: \(id, privacy: .public)")
-            return id
-        }
-        if let id = privateStringValue(named: "_hostBundleID", from: parent),
-           isUsableReturnBundleID(id) {
-            kbLog.notice("currentHostBundleID: resolved via _hostBundleID: \(id, privacy: .public)")
-            return id
-        }
-        if let id = currentHostBundleIDFromHostPID,
-           isUsableReturnBundleID(id) {
-            kbLog.notice("currentHostBundleID: resolved via host pid: \(id, privacy: .public)")
-            return id
-        }
-        kbLog.notice("currentHostBundleID unavailable")
-        return nil
-    }
-
-    private var currentHostBundleIDFromHostPID: String? {
-        guard let pid = currentHostProcessID else {
-            kbLog.notice("currentHostBundleIDFromHostPID: _hostPID unavailable")
-            return nil
-        }
-
-        let hostPID: AnyObject = NSNumber(value: pid)
-        if let id = currentHostBundleIDFromXPC(hostPID: hostPID) {
-            kbLog.notice("currentHostBundleIDFromHostPID: resolved via XPC: \(id, privacy: .public)")
-            return id
-        }
-
-        kbLog.notice("currentHostBundleIDFromHostPID: unresolved for pid=\(pid, privacy: .public)")
-        return nil
-    }
-
-    private var currentHostProcessID: Int32? {
-        if let number = privateIntMethodValue(named: "_hostProcessIdentifier", from: self),
-           number.int32Value > 0 {
-            return number.int32Value
-        }
-        guard let hostPID = privateObjectValue(named: "_hostPID", from: parent) else {
-            return nil
-        }
-        guard let pid = intValue(from: hostPID), pid > 0 else {
-            kbLog.notice("currentHostProcessID: invalid _hostPID \(String(describing: hostPID), privacy: .public)")
-            return nil
-        }
-        return pid
-    }
-
-    private func currentHostBundleIDFromXPC(hostPID: AnyObject) -> String? {
-        guard let serviceClass = NSClassFromString("PKService") else {
-            kbLog.notice("currentHostBundleIDFromXPC: PKService unavailable")
-            return nil
-        }
-        let serviceObject = serviceClass as AnyObject
-
-        let defaultServiceSelector = NSSelectorFromString("defaultService")
-        guard serviceObject.responds(to: defaultServiceSelector),
-              let service = serviceObject.perform(defaultServiceSelector)?.takeUnretainedValue() as? NSObject
-        else {
-            kbLog.notice("currentHostBundleIDFromXPC: defaultService unavailable")
-            return nil
-        }
-
-        let personalitiesSelector = NSSelectorFromString("personalities")
-        guard service.responds(to: personalitiesSelector),
-              let personalities = service.perform(personalitiesSelector)?.takeUnretainedValue() as? NSDictionary
-        else {
-            kbLog.notice("currentHostBundleIDFromXPC: personalities unavailable")
-            return nil
-        }
-
-        let extensionBundleIDs = [
-            Bundle.main.bundleIdentifier,
-            Bundle(for: type(of: self)).bundleIdentifier,
-        ].compactMap { $0 }
-
-        for extensionBundleID in extensionBundleIDs {
-            guard let infos = personalities.object(forKey: extensionBundleID) as? NSDictionary,
-                  let info = infos.object(forKey: hostPID) as? NSObject,
-                  let connection = privateObjectValue(named: "connection", from: info),
-                  let xpcConnection = privateObjectValue(named: "_xpcConnection", from: connection)
-            else { continue }
-
-            guard let bundleID = copyBundleID(fromXPCConnection: xpcConnection) else {
-                kbLog.notice("currentHostBundleIDFromXPC: xpc bundle id unavailable for \(extensionBundleID, privacy: .public)")
-                continue
-            }
-            return bundleID
-        }
-
-        kbLog.notice("currentHostBundleIDFromXPC: no personality matched host pid")
-        return nil
-    }
-
-    private func copyBundleID(fromXPCConnection connection: AnyObject) -> String? {
-        guard let handle = dlopen(nil, RTLD_NOW) else {
-            kbLog.notice("copyBundleIDFromXPCConnection: dlopen unavailable")
-            return nil
-        }
-
-        guard let symbol = dlsym(handle, "xpc_connection_copy_bundle_id") else {
-            kbLog.notice("copyBundleIDFromXPCConnection: symbol unavailable")
-            return nil
-        }
-
-        typealias CopyBundleID = @convention(c) (AnyObject) -> UnsafePointer<CChar>?
-        let copyBundleID = unsafeBitCast(symbol, to: CopyBundleID.self)
-        guard let cString = copyBundleID(connection) else { return nil }
-        return String(cString: cString)
-    }
-
-    private func writeHostWakeRequest(
-        action: String,
-        returnToKeyboard: Bool,
-        returnBundleID: String?,
-        returnProcessID: Int32?
-    ) {
-        guard hasFullAccess else {
-            kbLog.notice("writeHostWakeRequest: skipped without full access")
-            return
-        }
-        var payload: [String: Any] = [
-            "version": 1,
-            "id": UUID().uuidString,
-            "created_at": Date().timeIntervalSince1970,
-            "source": "keyboard",
-            "action": action,
-            "return": returnToKeyboard,
-            "correction_mode": correctionMode.rawValue,
-        ]
-        if let returnBundleID {
-            payload["return_bundle"] = returnBundleID
-        }
-        if let returnProcessID {
-            payload["return_pid"] = returnProcessID
-        }
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
-              let text = String(data: data, encoding: .utf8),
-              let pasteboard = UIPasteboard(name: hostWakePasteboardName, create: true)
-        else {
-            kbLog.notice("writeHostWakeRequest: failed to encode request")
-            return
-        }
-        pasteboard.string = text
-        kbLog.notice("writeHostWakeRequest: wrote action=\(action, privacy: .public), return=\(returnToKeyboard, privacy: .public), bundle=\(returnBundleID ?? "nil", privacy: .public), pid=\(returnProcessID.map(String.init) ?? "nil", privacy: .public)")
-    }
-
-    private func intValue(from object: AnyObject) -> Int32? {
-        if let number = object as? NSNumber {
-            return number.int32Value
-        }
-        let text = String(describing: object).trimmingCharacters(in: .whitespacesAndNewlines)
-        return Int32(text)
-    }
-
-    private func isUsableReturnBundleID(_ id: String) -> Bool {
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed != "<null>" else { return false }
-        guard isBundleIdentifierShape(trimmed) else { return false }
-        guard trimmed != Bundle.main.bundleIdentifier else { return false }
-        guard !trimmed.hasPrefix("com.typeforme.") else { return false }
-        guard !trimmed.hasPrefix("com.btcdtc.typeforme") else { return false }
-        return true
-    }
-
-    private func isBundleIdentifierShape(_ value: String) -> Bool {
-        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count >= 2 else { return false }
-        for part in parts {
-            guard !part.isEmpty else { return false }
-            guard part.allSatisfy({ character in
-                character.isLetter || character.isNumber || character == "-"
-            }) else { return false }
-        }
-        return true
-    }
-
-    private func privateStringValue(named name: String, from object: AnyObject?) -> String? {
-        guard let value = privateObjectValue(named: name, from: object) else { return nil }
-        if let string = value as? String { return string }
-        if let number = value as? NSNumber { return number.stringValue }
-        let text = String(describing: value)
-        return text == "<null>" ? nil : text
-    }
-
-    private func privateObjectValue(named name: String, from object: AnyObject?) -> AnyObject? {
-        guard let object else { return nil }
-        let selector = NSSelectorFromString(name)
-        if object.responds(to: selector) {
-            if let returnTypeText = methodReturnType(named: selector, from: object) {
-                if returnTypeText.hasPrefix("@") || returnTypeText == "#" {
-                    return object.perform(selector)?.takeUnretainedValue()
-                }
-                return privateIntMethodValue(named: name, from: object)
-            }
-            return object.perform(selector)?.takeUnretainedValue()
-        }
-
-        var nextClass: AnyClass? = object_getClass(object)
-        while let currentClass = nextClass {
-            if let ivar = class_getInstanceVariable(currentClass, name) {
-                return privateIvarValue(ivar, from: object)
-            }
-            nextClass = class_getSuperclass(currentClass)
-        }
-        return nil
-    }
-
-    private func privateIntMethodValue(named name: String, from object: AnyObject?) -> NSNumber? {
-        guard let object else { return nil }
-        let selector = NSSelectorFromString(name)
-        guard object.responds(to: selector),
-              let returnTypeText = methodReturnType(named: selector, from: object),
-              let imp = object.method(for: selector)
-        else { return nil }
-
-        switch returnTypeText {
-        case "i":
-            typealias Getter = @convention(c) (AnyObject, Selector) -> Int32
-            let getter = unsafeBitCast(imp, to: Getter.self)
-            return NSNumber(value: getter(object, selector))
-        case "I":
-            typealias Getter = @convention(c) (AnyObject, Selector) -> UInt32
-            let getter = unsafeBitCast(imp, to: Getter.self)
-            return NSNumber(value: getter(object, selector))
-        case "q":
-            typealias Getter = @convention(c) (AnyObject, Selector) -> Int64
-            let getter = unsafeBitCast(imp, to: Getter.self)
-            return NSNumber(value: getter(object, selector))
-        case "Q":
-            typealias Getter = @convention(c) (AnyObject, Selector) -> UInt64
-            let getter = unsafeBitCast(imp, to: Getter.self)
-            return NSNumber(value: getter(object, selector))
-        case "s":
-            typealias Getter = @convention(c) (AnyObject, Selector) -> Int16
-            let getter = unsafeBitCast(imp, to: Getter.self)
-            return NSNumber(value: getter(object, selector))
-        case "S":
-            typealias Getter = @convention(c) (AnyObject, Selector) -> UInt16
-            let getter = unsafeBitCast(imp, to: Getter.self)
-            return NSNumber(value: getter(object, selector))
-        case "c", "B":
-            typealias Getter = @convention(c) (AnyObject, Selector) -> Bool
-            let getter = unsafeBitCast(imp, to: Getter.self)
-            return NSNumber(value: getter(object, selector))
-        default:
-            return nil
-        }
-    }
-
-    private func methodReturnType(named selector: Selector, from object: AnyObject) -> String? {
-        guard let method = class_getInstanceMethod(type(of: object), selector),
-              method_getNumberOfArguments(method) == 2
-        else { return nil }
-        let returnType = method_copyReturnType(method)
-        let returnTypeText = String(cString: returnType)
-        free(returnType)
-        return returnTypeText
-    }
-
-    private func privateIvarValue(_ ivar: Ivar, from object: AnyObject) -> AnyObject? {
-        guard let typeEncoding = ivar_getTypeEncoding(ivar) else { return nil }
-        let type = String(cString: typeEncoding)
-        if type.hasPrefix("@") {
-            return object_getIvar(object, ivar) as AnyObject?
-        }
-
-        let offset = ivar_getOffset(ivar)
-        let rawPointer = Unmanaged.passUnretained(object).toOpaque().advanced(by: offset)
-        switch type {
-        case "i":
-            return NSNumber(value: rawPointer.load(as: Int32.self))
-        case "I":
-            return NSNumber(value: rawPointer.load(as: UInt32.self))
-        case "q":
-            return NSNumber(value: rawPointer.load(as: Int64.self))
-        case "Q":
-            return NSNumber(value: rawPointer.load(as: UInt64.self))
-        case "s":
-            return NSNumber(value: rawPointer.load(as: Int16.self))
-        case "S":
-            return NSNumber(value: rawPointer.load(as: UInt16.self))
-        case "c", "B":
-            return NSNumber(value: rawPointer.load(as: Bool.self))
-        default:
-            kbLog.notice("privateIvarValue: unsupported ivar type \(type, privacy: .public)")
-            return nil
-        }
-    }
-
     @objc private func openHostFromSettingsButton() {
         lightHaptic()
         openStandbyInHostApp(returnToKeyboard: false)
@@ -1767,7 +1626,6 @@ final class KeyboardViewController: UIInputViewController {
     @objc private func selectCorrectionModeButton(_ sender: UIButton) {
         guard let preset = correctionModeButtons.first(where: { $0.button === sender })?.preset else { return }
         correctionMode = preset
-        hasUserSelectedCorrectionMode = true
         lightHaptic()
         updateUI()
         rewriteCurrentInputOrPasteboard(using: preset)
@@ -2570,13 +2428,6 @@ final class KeyboardViewController: UIInputViewController {
         }
         bridgeStatus = status
         lastBridgeContactAt = Date().timeIntervalSince1970
-        if !hasUserSelectedCorrectionMode,
-           let rawDefault = status.defaultCorrectionMode,
-           let defaultMode = CorrectionModePreset(rawValue: rawDefault),
-           defaultMode != correctionMode {
-            correctionMode = defaultMode
-            lastCorrectionModeButtonSignature = ""
-        }
         if status.state == .result,
            status.commandID != styleRewriteCommandID,
            let commandID = status.commandID,
