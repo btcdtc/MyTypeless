@@ -185,6 +185,10 @@ final class AppState: ObservableObject {
         phase.isBusy
     }
 
+    var canRestyleCurrentResult: Bool {
+        !phase.isBusy && currentRestyleSource() != nil
+    }
+
     var isConfigured: Bool {
         !config.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && config.hasAnyBridgeURL
@@ -348,9 +352,15 @@ final class AppState: ObservableObject {
             supportedOptions: config.supportedLanguageOptions
         )
         selectedLanguageIDs = Set(config.validatedLanguageIDs)
-        correctionMode = settings.correctionMode
+        if shouldDisplayDefaultCorrectionMode {
+            correctionMode = settings.correctionMode
+        }
         store.save(config)
         publishKeyboardDefaults()
+    }
+
+    private var shouldDisplayDefaultCorrectionMode: Bool {
+        !phase.isBusy && currentRestyleSource() == nil
     }
 
     private func resetCorrectionModeToDefault() {
@@ -740,14 +750,14 @@ final class AppState: ObservableObject {
         // Block mode changes while a request is mid-flight to avoid a stale
         // result coming back in the old mode while the UI shows the new one.
         guard !isBusy else { return }
-        correctionMode = newMode
-
         guard let source = currentRestyleSource() else {
             rawTranscript = ""
             sessionID = nil
             lastGeneratedResultText = nil
+            resetCorrectionModeToDefault()
             return
         }
+        correctionMode = newMode
         await refreshRoute(force: true, probeAllEndpoints: false)
         guard let baseURL = routeStatus.activeURL else {
             setFailure("Bridge unavailable. Check pairing, Local URL, or Cloud URL.")
@@ -809,6 +819,7 @@ final class AppState: ObservableObject {
         rawTranscript = ""
         sessionID = nil
         lastGeneratedResultText = nil
+        resetCorrectionModeToDefault()
         setPhase(.idle)
     }
 

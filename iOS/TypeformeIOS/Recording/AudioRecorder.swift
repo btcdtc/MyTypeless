@@ -518,7 +518,17 @@ final class StandbyAudioSession: ObservableObject {
         }
         guard sampleCount > 0 else { return 0 }
         let rms = sqrt(sum / Float(sampleCount))
-        return min(1, max(0, pow(rms * 10, 0.65)))
+        guard rms.isFinite, rms > 0 else { return 0 }
+
+        // The standby keyboard path runs through iOS voice processing / AGC,
+        // so raw RMS can sit near a constant "loud" value. Convert to dB and
+        // apply the same floor curve as the host recorder to keep normal
+        // speech below saturation and preserve visible dynamics.
+        let db = 20 * log10f(max(rms, 0.00001))
+        let floor: Float = -45
+        let clamped = max(floor, min(0, db))
+        let linear = (clamped - floor) / -floor
+        return min(1, max(0, pow(linear, 0.55)))
     }
 }
 

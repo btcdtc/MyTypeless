@@ -478,12 +478,10 @@ private struct VoicePrintBars: View {
         let total = CGFloat(barCount)
         let gap = (size.width - total * barW) / (total + 1)
 
-        // Baseline 0.30 gives clearly visible motion even at silence; speech
-        // amplifies on top via `voiceBoost`. With `level = 0` the bars still
-        // breathe between ~30% and full-wave-modulated 30%; with `level = 0.5`
-        // (speech) envelope hits 1.0 and bars span the full range.
-        let baseline: CGFloat = 0.30
-        let voiceBoost = CGFloat(level) * 2.2
+        // Keep speech below saturation so the bars track meter changes instead
+        // of looking like a fixed full-range animation.
+        let baseline: CGFloat = 0.22
+        let voiceBoost = CGFloat(level) * 1.05
         let envelope = min(1.0, baseline + voiceBoost)
 
         for i in 0..<barCount {
@@ -521,7 +519,7 @@ private struct ModeChipsRow: View {
                     ModeChip(
                         mode: mode,
                         isSelected: state.correctionMode == mode,
-                        isDisabled: state.isBusy
+                        isDisabled: state.isBusy || !state.canRestyleCurrentResult
                     ) {
                         Task { await state.applyCorrectionMode(mode) }
                     }

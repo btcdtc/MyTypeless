@@ -59,6 +59,7 @@ final class KeyboardViewController: UIInputViewController {
     private var statusTimer: Timer?
     private var statusTimerInterval: TimeInterval = 0
     private var lastStatusSignature = ""
+    private var lastMissingAudioLevelLogAt: TimeInterval = 0
     private var bridgeStatus: KeyboardBridgeStatus?
     private var lastBridgeContactAt: TimeInterval = 0
     private var openingHostUntil: TimeInterval = 0
@@ -237,8 +238,12 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func resetCorrectionModeToDefault() {
-        correctionMode = defaultCorrectionModeFromHost() ?? .polish
+        correctionMode = currentDefaultCorrectionMode()
         lastCorrectionModeButtonSignature = ""
+    }
+
+    private func currentDefaultCorrectionMode() -> CorrectionModePreset {
+        defaultCorrectionModeFromHost() ?? .polish
     }
 
     private func defaultCorrectionModeFromHost() -> CorrectionModePreset? {
@@ -836,7 +841,7 @@ final class KeyboardViewController: UIInputViewController {
 
         voicePrint.isActive = isRecordingState
         if isRecordingState {
-            voicePrint.level = currentBridgeStatus?.audioLevel ?? 0
+            voicePrint.updateLevel(currentBridgeStatus?.audioLevel)
             startPulseRings()
         } else {
             stopPulseRings()
@@ -1272,10 +1277,11 @@ final class KeyboardViewController: UIInputViewController {
         var components = URLComponents()
         components.scheme = "typeforme"
         components.host = action
+        let requestedCorrectionMode = action == "record" ? currentDefaultCorrectionMode() : correctionMode
         var queryItems = [
             URLQueryItem(name: "source", value: "keyboard"),
             URLQueryItem(name: "return", value: returnToKeyboard ? "1" : "0"),
-            URLQueryItem(name: "correction_mode", value: correctionMode.rawValue),
+            URLQueryItem(name: "correction_mode", value: requestedCorrectionMode.rawValue),
         ]
         if returnToKeyboard, let returnBundleID = currentHostBundleID {
             queryItems.append(URLQueryItem(name: "return_bundle", value: returnBundleID))
@@ -1530,9 +1536,14 @@ final class KeyboardViewController: UIInputViewController {
         shouldStopWhenStartCompletes = false
         shouldCancelWhenStartCompletes = false
         activeRecordingTextTarget = target
+        let recordingMode = currentDefaultCorrectionMode()
+        if correctionMode != recordingMode {
+            correctionMode = recordingMode
+            lastCorrectionModeButtonSignature = ""
+        }
         let command = KeyboardBridgeCommand(
             action: .start,
-            correctionMode: correctionMode.rawValue,
+            correctionMode: recordingMode.rawValue,
             textEditContext: textEditContext,
             dictationContext: textEditContext == nil ? currentDictationContext() : nil
         )
@@ -1625,9 +1636,7 @@ final class KeyboardViewController: UIInputViewController {
 
     @objc private func selectCorrectionModeButton(_ sender: UIButton) {
         guard let preset = correctionModeButtons.first(where: { $0.button === sender })?.preset else { return }
-        correctionMode = preset
         lightHaptic()
-        updateUI()
         rewriteCurrentInputOrPasteboard(using: preset)
     }
 
@@ -1673,6 +1682,8 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
+        correctionMode = preset
+        lastCorrectionModeButtonSignature = ""
         let command = KeyboardBridgeCommand(
             action: .restyleText,
             correctionMode: preset.rawValue,
@@ -2460,7 +2471,16 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         if status.state == .recording {
-            voicePrint.level = status.audioLevel ?? 0
+            voicePrint.updateLevel(status.audioLevel)
+            if status.audioLevel == nil {
+                let now = Date().timeIntervalSince1970
+                if now - lastMissingAudioLevelLogAt > 2 {
+                    lastMissingAudioLevelLogAt = now
+                    kbLog.notice("recording status has no audioLevel; using local voiceprint animation")
+                }
+            } else {
+                lastMissingAudioLevelLogAt = 0
+            }
         }
 
         let signature = [
@@ -2489,19 +2509,15 @@ private final class VoiceOrbButton: UIButton {
     }
 }
 
-/// Vertical-bars voiceprint rendered with a `CADisplayLink`. `level` is the
-/// most recent normalized RMS sample (0...1) from the host's microphone
-/// metering — set it on each status poll. The view smooths between samples and
-/// mixes two phase-shifted sines per bar so the motion stays organic even
-/// during silence.
+/// Vertical-bars voiceprint driven by Core Animation. The keyboard extension
+/// can have an unreliable app run loop while hosted inside another app, so the
+/// recording affordance must not depend on per-frame `CADisplayLink` updates.
+/// Host audio levels only adjust animation intensity and speed.
 private final class VoicePrintView: UIView {
     var level: Float = 0 {
         didSet {
             targetLevel = max(0, min(1, level))
-            lastLevelUpdateAt = CACurrentMediaTime()
-            if isIdleBarAnimationActive {
-                stopBarAnimations()
-            }
+            applyLiveLevel()
         }
     }
 
@@ -2516,16 +2532,16 @@ private final class VoicePrintView: UIView {
         didSet { barLayers.forEach { $0.backgroundColor = tint.cgColor } }
     }
 
+    func updateLevel(_ level: Float?) {
+        guard let level else { return }
+        self.level = level
+    }
+
     private let barCount = 9
     private var barLayers: [CALayer] = []
-    private var displayLink: CADisplayLink?
-    private var phase: CFTimeInterval = 0
-    private var smoothedLevel: Float = 0
     private var targetLevel: Float = 0
-    private var lastLevelUpdateAt: CFTimeInterval = 0
-    private var isIdleBarAnimationActive = false
-
-    private let staleLevelInterval: CFTimeInterval = 0.5
+    private var isAnimatingBars = false
+    private var animationLevelBucket = -1
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -2537,13 +2553,14 @@ private final class VoicePrintView: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
 
     deinit {
-        displayLink?.invalidate()
+        stopBarAnimations()
     }
 
     private func setupBars() {
         for _ in 0..<barCount {
             let layer = CALayer()
             layer.backgroundColor = tint.cgColor
+            layer.opacity = 1
             layer.cornerRadius = 2.5
             layer.cornerCurve = .continuous
             self.layer.addSublayer(layer)
@@ -2564,115 +2581,115 @@ private final class VoicePrintView: UIView {
         let totalBars = CGFloat(barCount)
         let gap = (w - totalBars * barW) / (totalBars + 1)
         let centerY = h / 2
-        let baseHeight = max(8, h * 0.18)
+        let baseHeight = max(6, h * 0.12)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for (i, layer) in barLayers.enumerated() {
             let x = gap + CGFloat(i) * (barW + gap)
-            layer.frame = CGRect(x: x, y: centerY - baseHeight / 2, width: barW, height: baseHeight)
+            layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            layer.bounds = CGRect(x: 0, y: 0, width: barW, height: baseHeight)
+            layer.position = CGPoint(x: x + barW / 2, y: centerY)
         }
         CATransaction.commit()
+        if isActive {
+            restartBarAnimations()
+        }
     }
 
     private func start() {
-        guard displayLink == nil else { return }
-        lastLevelUpdateAt = CACurrentMediaTime()
-        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-        if #available(iOS 15.0, *) {
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
-        }
-        link.add(to: .main, forMode: .common)
-        displayLink = link
+        animationLevelBucket = -1
+        setNeedsLayout()
+        layoutIfNeeded()
+        startBarAnimations()
     }
 
     private func stop() {
-        displayLink?.invalidate()
-        displayLink = nil
         stopBarAnimations()
-        smoothedLevel = 0
         targetLevel = 0
-        lastLevelUpdateAt = 0
+        animationLevelBucket = -1
         layoutBars()
     }
 
     private func startBarAnimations() {
-        guard !isIdleBarAnimationActive else { return }
-        isIdleBarAnimationActive = true
+        guard !isAnimatingBars else { return }
+        isAnimatingBars = true
+        installBarAnimations(level: targetLevel)
+    }
+
+    private func restartBarAnimations() {
+        guard isAnimatingBars else { return }
+        installBarAnimations(level: targetLevel)
+    }
+
+    private func installBarAnimations(level: Float) {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let bucket = Int((max(0, min(1, level)) * 6).rounded())
+        guard bucket != animationLevelBucket || barLayers.contains(where: { $0.animation(forKey: "voiceprint.breathe") == nil }) else {
+            return
+        }
+        animationLevelBucket = bucket
+        let normalizedLevel = CGFloat(bucket) / 6.0
         let now = CACurrentMediaTime()
         for (i, layer) in barLayers.enumerated() {
-            let animation = CAKeyframeAnimation(keyPath: "transform.scale.y")
-            animation.values = [0.70, 1.25, 0.82, 1.42, 0.74]
-            animation.keyTimes = [0, 0.28, 0.52, 0.78, 1]
-            animation.duration = 0.86 + Double(i % 3) * 0.08
-            animation.beginTime = now + Double(i) * 0.045
+            layer.removeAnimation(forKey: "voiceprint.breathe")
+            layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            let animation = CAKeyframeAnimation(keyPath: "bounds.size.height")
+            let duration: CFTimeInterval = 1.08
+            let sampleCount = 18
+            animation.values = (0..<sampleCount).map { sample in
+                let t = Double(sample) / Double(sampleCount - 1)
+                return NSNumber(value: Double(Self.barHeight(
+                    index: i,
+                    barCount: barCount,
+                    containerHeight: bounds.height,
+                    level: normalizedLevel,
+                    phase: t * duration
+                )))
+            }
+            animation.keyTimes = (0..<sampleCount).map { sample in
+                NSNumber(value: Double(sample) / Double(sampleCount - 1))
+            }
+            animation.duration = duration
+            animation.beginTime = now
             animation.repeatCount = .infinity
             animation.isRemovedOnCompletion = false
-            animation.timingFunctions = [
-                CAMediaTimingFunction(name: .easeInEaseOut),
-                CAMediaTimingFunction(name: .easeInEaseOut),
-                CAMediaTimingFunction(name: .easeInEaseOut),
-                CAMediaTimingFunction(name: .easeInEaseOut),
-            ]
+            animation.calculationMode = .linear
             layer.add(animation, forKey: "voiceprint.breathe")
         }
     }
 
     private func stopBarAnimations() {
-        guard isIdleBarAnimationActive else { return }
-        isIdleBarAnimationActive = false
+        guard isAnimatingBars else { return }
+        isAnimatingBars = false
         for layer in barLayers {
             layer.removeAnimation(forKey: "voiceprint.breathe")
             layer.transform = CATransform3DIdentity
+            layer.speed = 1
         }
     }
 
-    @objc private func tick(_ link: CADisplayLink) {
-        phase += link.duration
-        updateIdleBarAnimationIfNeeded(now: CACurrentMediaTime())
-        let rate: Float = targetLevel > smoothedLevel ? 0.45 : 0.12
-        smoothedLevel += (targetLevel - smoothedLevel) * rate
-
-        let h = bounds.height
-        guard h > 0, bounds.width > 0 else { return }
-        let centerY = h / 2
-        let minH = max(6, h * 0.12)
-        let maxH = h * 0.95
-        // Baseline 0.30 + voiceBoost (level * 2.2): bars breathe visibly at
-        // silence, span the full range when speech hits. Old `0.08 * (0.45+
-        // 0.55*wave)` formula collapsed everything into the bottom 8% of the
-        // view height — looked frozen.
-        let baseline: CGFloat = 0.30
-        let voiceBoost = CGFloat(smoothedLevel) * 2.2
-        let envelope = min(1.0, baseline + voiceBoost)
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for (i, layer) in barLayers.enumerated() {
-            let bias = abs(Double(i) - Double(barCount - 1) / 2.0) / (Double(barCount - 1) / 2.0)
-            let centerBoost = 1.0 - bias * 0.30
-            let bandPhase = Double(i) * 0.55
-            let s = sin(phase * 5.4 + bandPhase) * 0.55 + sin(phase * 11.1 + bandPhase * 2.3) * 0.45
-            let waveform = CGFloat((s + 1) / 2)
-            let modulation = envelope * CGFloat(centerBoost) * (0.35 + 0.65 * waveform)
-            let barH = max(minH, min(maxH, minH + (maxH - minH) * modulation))
-            var frame = layer.frame
-            frame.origin.y = centerY - barH / 2
-            frame.size.height = barH
-            layer.frame = frame
-        }
-        CATransaction.commit()
+    private func applyLiveLevel() {
+        guard isActive else { return }
+        installBarAnimations(level: targetLevel)
     }
 
-    private func updateIdleBarAnimationIfNeeded(now: CFTimeInterval) {
-        guard isActive, lastLevelUpdateAt > 0 else {
-            stopBarAnimations()
-            return
-        }
-        if now - lastLevelUpdateAt > staleLevelInterval {
-            startBarAnimations()
-        } else {
-            stopBarAnimations()
-        }
+    private static func barHeight(
+        index: Int,
+        barCount: Int,
+        containerHeight: CGFloat,
+        level: CGFloat,
+        phase: CFTimeInterval
+    ) -> CGFloat {
+        let minH = max(6, containerHeight * 0.12)
+        let maxH = containerHeight * 0.95
+        let centerBias = abs(Double(index) - Double(barCount - 1) / 2.0) / (Double(barCount - 1) / 2.0)
+        let centerBoost = 1.0 - centerBias * 0.30
+        let bandPhase = Double(index) * 0.55
+        let s = sin(phase * 5.4 + bandPhase) * 0.55 + sin(phase * 11.1 + bandPhase * 2.3) * 0.45
+        let waveform = CGFloat((s + 1) / 2)
+        let envelope = min(1.0, 0.22 + level * 1.05)
+        let modulation = envelope * CGFloat(centerBoost) * (0.35 + 0.65 * waveform)
+        return max(minH, min(maxH, minH + (maxH - minH) * modulation))
     }
 }
 
