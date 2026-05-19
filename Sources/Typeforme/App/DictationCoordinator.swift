@@ -12,6 +12,7 @@ final class DictationCoordinator: ObservableObject {
     @Published private(set) var lastCorrected: String = ""
     @Published private(set) var audioLevel: Float = 0
     @Published private(set) var frontmostSnapshot: FrontmostAppSnapshot?
+    @Published private(set) var previewCorrectionMode: CorrectionMode?
 
     private let recorder = AudioRecorder()
     /// Resolved per-request so provider/model setting changes take effect immediately.
@@ -82,6 +83,7 @@ final class DictationCoordinator: ObservableObject {
         let cancelToken = CommitCancellationToken()
         activeSessionID = sessionID
         activeCancelToken = cancelToken
+        previewCorrectionMode = nil
         startInProgress = true
         stopAfterStart = false
         resetTask?.cancel(); resetTask = nil
@@ -260,6 +262,7 @@ final class DictationCoordinator: ObservableObject {
                         latencyMs: elapsedMs(since: editStarted),
                         timeoutMs: AppSettings.correctionTimeoutMs
                     )
+                    previewCorrectionMode = selectedCorrectionMode
                     lastCorrected = result.text
                     await finishTextEdit(
                         result,
@@ -292,6 +295,7 @@ final class DictationCoordinator: ObservableObject {
                     request: request,
                     timeoutMs: AppSettings.correctionTimeoutMs
                 )
+                previewCorrectionMode = request.correctionMode
                 lastCorrected = normalizedResult.text
                 await finish(with: normalizedResult, sessionID: sessionID, cancelToken: cancelToken)
             } catch CorrectorError.empty {
@@ -329,6 +333,7 @@ final class DictationCoordinator: ObservableObject {
                     request: request,
                     timeoutMs: AppSettings.correctionTimeoutMs
                 )
+                previewCorrectionMode = request.correctionMode
                 lastCorrected = timeoutResult.text
                 await finish(with: timeoutResult, sessionID: sessionID, cancelToken: cancelToken)
             }
@@ -381,6 +386,7 @@ final class DictationCoordinator: ObservableObject {
         activeTextEditIntent = nil
         activeDictationContextBefore = ""
         activeDictationContextAfter = ""
+        previewCorrectionMode = nil
         startInProgress = false
         stopAfterStart = false
         recordingStartedAt = nil
@@ -405,6 +411,7 @@ final class DictationCoordinator: ObservableObject {
         lastError = nil
         lastTranscript = ""
         lastCorrected = ""
+        previewCorrectionMode = nil
         frontmostSnapshot = nil
         remoteBridgeSessionID = nil
         activeTextEditTarget = nil
@@ -428,6 +435,7 @@ final class DictationCoordinator: ObservableObject {
         activeTextEditIntent = nil
         activeDictationContextBefore = ""
         activeDictationContextAfter = ""
+        previewCorrectionMode = nil
         startInProgress = false
         stopAfterStart = false
         recordingStartedAt = nil
@@ -460,6 +468,7 @@ final class DictationCoordinator: ObservableObject {
         activeTextEditIntent = nil
         activeDictationContextBefore = ""
         activeDictationContextAfter = ""
+        previewCorrectionMode = nil
         recordingStartedAt = nil
         _ = recorder.stop()
     }
@@ -471,9 +480,8 @@ final class DictationCoordinator: ObservableObject {
         let raw = lastTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return }
 
-        let previousModeRaw = AppSettings.correctionMode.rawValue
-        UserDefaults.standard.set(newMode.rawValue, forKey: AppSettings.Keys.correctionMode)
-        let shouldResetMode = AppSettings.processingMode == .client
+        let previousPreviewMode = previewCorrectionMode
+        previewCorrectionMode = newMode
 
         let sessionID = UUID()
         let cancelToken = CommitCancellationToken()
@@ -483,17 +491,15 @@ final class DictationCoordinator: ObservableObject {
         transition(to: .correcting)
 
         if AppSettings.processingMode == .client {
-            defer {
-                if shouldResetMode {
-                    UserDefaults.standard.set(previousModeRaw, forKey: AppSettings.Keys.correctionMode)
-                }
-            }
-            await requestRemoteCorrectionModeChange(
+            let didRestyle = await requestRemoteCorrectionModeChange(
                 rawTranscript: raw,
                 newMode: newMode,
                 sessionID: sessionID,
                 cancelToken: cancelToken
             )
+            if !didRestyle {
+                previewCorrectionMode = previousPreviewMode
+            }
             return
         }
 
@@ -507,10 +513,13 @@ final class DictationCoordinator: ObservableObject {
             transition(to: .preview)
             scheduleAutoReset(after: Self.previewResetDelay)
         } catch is CancellationError {
+            previewCorrectionMode = previousPreviewMode
             transition(to: .idle)
         } catch CorrectorError.empty {
+            previewCorrectionMode = previousPreviewMode
             transition(to: .idle)
         } catch {
+            previewCorrectionMode = previousPreviewMode
             reportError("Re-correction failed: \(error.localizedDescription)")
             scheduleAutoReset(after: Self.errorResetDelay)
         }
@@ -653,6 +662,7 @@ final class DictationCoordinator: ObservableObject {
                     latencyMs: editResponse.editLatencyMs ?? editResponse.latencyMs,
                     timeoutMs: AppSettings.correctionTimeoutMs
                 )
+                previewCorrectionMode = selectedCorrectionMode
                 lastCorrected = editResponse.text
                 await finishTextEdit(
                     TextEditResult(action: .replaceTarget, text: editResponse.text),
@@ -678,6 +688,7 @@ final class DictationCoordinator: ObservableObject {
                 latencyMs: response.correctionLatencyMs ?? response.latencyMs,
                 timeoutMs: AppSettings.correctionTimeoutMs
             )
+            previewCorrectionMode = selectedCorrectionMode
             lastCorrected = result.text
             await finish(with: result, sessionID: sessionID, cancelToken: cancelToken)
         } catch is CancellationError {
@@ -703,7 +714,7 @@ final class DictationCoordinator: ObservableObject {
         newMode: CorrectionMode,
         sessionID: UUID,
         cancelToken: CommitCancellationToken
-    ) async {
+    ) async -> Bool {
         do {
             let snapshot = frontmostSnapshot
             let resolved = try await RemoteBridgeClient.resolvedFromSettings(probeAllEndpoints: false)
@@ -723,15 +734,19 @@ final class DictationCoordinator: ObservableObject {
                 correctionMode: newMode
             )
             remoteBridgeSessionID = response.sessionID
+            previewCorrectionMode = newMode
             lastCorrected = result.text
             copyPreviewToPasteboard(result)
             transition(to: .preview)
             scheduleAutoReset(after: Self.previewResetDelay)
+            return true
         } catch is CancellationError {
             transition(to: .idle)
+            return false
         } catch {
             reportError("Remote re-correction failed: \(error.localizedDescription)")
             scheduleAutoReset(after: Self.errorResetDelay)
+            return false
         }
     }
 

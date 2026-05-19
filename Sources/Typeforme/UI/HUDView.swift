@@ -302,7 +302,6 @@ private struct ProcessingIndicator: View {
 private struct ModeChipRow: View {
     @ObservedObject var coordinator: DictationCoordinator
     let disabled: Bool
-    @AppStorage(AppSettings.Keys.correctionMode) private var activeRaw: String = CorrectionMode.polish.rawValue
 
     var body: some View {
         HStack(spacing: 4) {
@@ -322,7 +321,7 @@ private struct ModeChipRow: View {
     }
 
     private var active: CorrectionMode {
-        CorrectionMode(rawValue: activeRaw) ?? .polish
+        coordinator.previewCorrectionMode ?? AppSettings.correctionMode
     }
 
     private func shortLabel(for mode: CorrectionMode) -> String {
